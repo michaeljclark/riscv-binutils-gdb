@@ -2704,10 +2704,98 @@ riscv_relax_delete_bytes (bfd *abfd, asection *sec, bfd_vma addr, size_t count)
   return TRUE;
 }
 
+/* A second format for recording PC-relative hi relocations.  This stores the
+   information required to relax them to GP-relative addresses.  */
+
+typedef struct riscv_pcgp_hi_reloc riscv_pcgp_hi_reloc;
+struct riscv_pcgp_hi_reloc
+{
+  bfd_vma hi_sec_off;
+  bfd_vma hi_addr;
+  unsigned hi_sym;
+  riscv_pcgp_hi_reloc *next;
+};
+
+typedef struct
+{
+  riscv_pcgp_hi_reloc *head;
+} riscv_pcgp_relocs;
+
+static bfd_boolean
+riscv_init_pcgp_relocs (riscv_pcgp_relocs *p)
+{
+  p->head = NULL;
+  return TRUE;
+}
+
+static bfd_boolean
+riscv_free_pcgp_relocs (riscv_pcgp_relocs *p, bfd *bfd, asection *sec)
+{
+  for (riscv_pcgp_hi_reloc *c = p->head; c != NULL;)
+    {
+      riscv_pcgp_hi_reloc *next = c->next;
+      free (c);
+      c = next;
+    }
+}
+
+static bfd_boolean
+riscv_record_pcgp_hi_reloc (riscv_pcgp_relocs *p, bfd_vma hi_sec_off, bfd_vma hi_addr, unsigned hi_sym)
+{
+  riscv_pcgp_hi_reloc *new = bfd_malloc (sizeof(*new));
+  if (!new)
+    return FALSE;
+  new->hi_sec_off = hi_sec_off;
+  new->hi_addr = hi_addr;
+  new->hi_sym = hi_sym;
+  new->next = p->head;
+  p->head = new;
+  return FALSE;
+}
+
+static riscv_pcgp_hi_reloc *
+riscv_find_pcgp_hi_reloc(riscv_pcgp_relocs *p, bfd_vma hi_sec_off)
+{
+  for (riscv_pcgp_hi_reloc *c = p->head; c != NULL; c = c->next)
+    if (c->hi_sec_off == hi_sec_off)
+      return c;
+  return NULL;
+}
+
+static bfd_boolean
+riscv_delete_pcgp_hi_reloc(riscv_pcgp_relocs *p, bfd_vma hi_sec_off, size_t bytes)
+{
+  bfd_boolean out = FALSE;
+
+  for (riscv_pcgp_hi_reloc *c = p->head; c != NULL; c = c->next)
+    {
+      if (c->hi_sec_off == hi_sec_off)
+	out = TRUE;
+
+      if (c->hi_sec_off > hi_sec_off)
+        c->hi_sec_off -= bytes;
+    }
+
+  return out;
+}
+
+static bfd_boolean
+riscv_use_pcgp_hi_reloc(riscv_pcgp_relocs *p, bfd_vma hi_sec_off)
+{
+  bfd_boolean out = FALSE;
+
+  for (riscv_pcgp_hi_reloc *c = p->head; c != NULL; c = c->next)
+    if (c->hi_sec_off == hi_sec_off)
+      out = TRUE;
+
+  return out;
+}
+
 typedef bfd_boolean (*relax_func_t) (bfd *, asection *, asection *,
 				     struct bfd_link_info *,
 				     Elf_Internal_Rela *,
-				     bfd_vma, bfd_vma, bfd_vma, bfd_boolean *);
+				     bfd_vma, bfd_vma, bfd_vma, bfd_boolean *,
+				     riscv_pcgp_relocs *);
 
 /* Relax AUIPC + JALR into JAL.  */
 
@@ -2718,7 +2806,8 @@ _bfd_riscv_relax_call (bfd *abfd, asection *sec, asection *sym_sec,
 		       bfd_vma symval,
 		       bfd_vma max_alignment,
 		       bfd_vma reserve_size ATTRIBUTE_UNUSED,
-		       bfd_boolean *again)
+		       bfd_boolean *again,
+		       riscv_pcgp_relocs *pcgp_relocs ATTRIBUTE_UNUSED)
 {
   bfd_byte *contents = elf_section_data (sec)->this_hdr.contents;
   bfd_signed_vma foff = symval - (sec_addr (sec) + rel->r_offset);
@@ -2801,7 +2890,8 @@ _bfd_riscv_relax_lui (bfd *abfd,
 		      bfd_vma symval,
 		      bfd_vma max_alignment,
 		      bfd_vma reserve_size,
-		      bfd_boolean *again)
+		      bfd_boolean *again,
+		      riscv_pcgp_relocs *pcgp_relocs ATTRIBUTE_UNUSED)
 {
   bfd_byte *contents = elf_section_data (sec)->this_hdr.contents;
   bfd_vma gp = riscv_global_pointer_value (link_info);
@@ -2889,7 +2979,8 @@ _bfd_riscv_relax_tls_le (bfd *abfd,
 			 bfd_vma symval,
 			 bfd_vma max_alignment ATTRIBUTE_UNUSED,
 			 bfd_vma reserve_size ATTRIBUTE_UNUSED,
-			 bfd_boolean *again)
+			 bfd_boolean *again,
+			 riscv_pcgp_relocs *prcel_relocs ATTRIBUTE_UNUSED)
 {
   /* See if this symbol is in range of tp.  */
   if (RISCV_CONST_HIGH_PART (tpoff (link_info, symval)) != 0)
@@ -2928,7 +3019,8 @@ _bfd_riscv_relax_align (bfd *abfd, asection *sec,
 			bfd_vma symval,
 			bfd_vma max_alignment ATTRIBUTE_UNUSED,
 			bfd_vma reserve_size ATTRIBUTE_UNUSED,
-			bfd_boolean *again ATTRIBUTE_UNUSED)
+			bfd_boolean *again ATTRIBUTE_UNUSED,
+			riscv_pcgp_relocs *pcrel_relocs ATTRIBUTE_UNUSED)
 {
   bfd_byte *contents = elf_section_data (sec)->this_hdr.contents;
   bfd_vma alignment = 1, pos;
@@ -2966,6 +3058,90 @@ _bfd_riscv_relax_align (bfd *abfd, asection *sec,
 				   rel->r_addend - nop_bytes);
 }
 
+static bfd_boolean
+_bfd_riscv_relax_pc  (bfd *abfd,
+		      asection *sec,
+		      asection *sym_sec,
+		      struct bfd_link_info *link_info,
+		      Elf_Internal_Rela *rel,
+		      bfd_vma symval,
+		      bfd_vma max_alignment,
+		      bfd_vma reserve_size,
+		      bfd_boolean *again ATTRIBUTE_UNUSED,
+		      riscv_pcgp_relocs *pcgp_relocs)
+{
+  bfd_vma gp = riscv_global_pointer_value (link_info);
+
+  BFD_ASSERT (rel->r_offset + 4 <= sec->size);
+
+  /* Chain the _LO relocs to their cooresponding _HI reloc to compute the
+   * actual target address.  */
+  riscv_pcgp_hi_reloc hi_reloc = {0};
+  switch (ELFNN_R_TYPE (rel->r_info))
+    {
+    case R_RISCV_PCREL_LO12_I:
+    case R_RISCV_PCREL_LO12_S:
+      {
+	riscv_pcgp_hi_reloc *hi = riscv_find_pcgp_hi_reloc(pcgp_relocs, symval - sec_addr(sym_sec));
+	if (hi == NULL)
+	  return TRUE;
+
+	hi_reloc = *hi;
+	symval = hi_reloc.hi_addr;
+	if (!riscv_use_pcgp_hi_reloc(pcgp_relocs, hi->hi_sec_off))
+	  (*_bfd_error_handler)
+	   (_("%B(%A+0x%lx): Unable to clear RISCV_PCREL_HI20 reloc for cooresponding RISCV_PCREL_LO12 reloc"),
+	    abfd, sec, rel->r_offset);
+      }
+      break;
+
+    case R_RISCV_PCREL_HI20:
+      /* Mergeable symbols and code might later move out of range.  */
+      if (sym_sec->flags & (SEC_MERGE | SEC_CODE))
+	return TRUE;
+
+      riscv_record_pcgp_hi_reloc (pcgp_relocs, rel->r_offset, symval, ELFNN_R_SYM(rel->r_info));
+      break;
+
+    default:
+      abort ();
+    }
+
+  /* Is the reference in range of x0 or gp?
+     Valid gp range conservatively because of alignment issue.  */
+  if (VALID_ITYPE_IMM (symval)
+      || (symval >= gp
+	  && VALID_ITYPE_IMM (symval - gp + max_alignment + reserve_size))
+      || (symval < gp
+	  && VALID_ITYPE_IMM (symval - gp - max_alignment - reserve_size)))
+    {
+      unsigned sym = hi_reloc.hi_sym;
+      switch (ELFNN_R_TYPE (rel->r_info))
+	{
+	case R_RISCV_PCREL_LO12_I:
+	  rel->r_info = ELFNN_R_INFO (sym, R_RISCV_GPREL_I);
+	  return TRUE;
+
+	case R_RISCV_PCREL_LO12_S:
+	  rel->r_info = ELFNN_R_INFO (sym, R_RISCV_GPREL_S);
+	  return TRUE;
+
+	case R_RISCV_PCREL_HI20:
+	  /* We can delete the unnecessary AUIPC and reloc.  */
+	  rel->r_info = ELFNN_R_INFO (0, R_RISCV_NONE);
+	  *again = TRUE;
+	  if (!riscv_relax_delete_bytes (abfd, sec, rel->r_offset, 4))
+	    return FALSE;
+	  return riscv_delete_pcgp_hi_reloc (pcgp_relocs, rel->r_offset, 4);
+
+	default:
+	  abort ();
+	}
+    }
+
+  return TRUE;
+}
+
 /* Relax a section.  Pass 0 shortens code sequences unless disabled.
    Pass 1, which cannot be disabled, handles code alignment directives.  */
 
@@ -2981,6 +3157,7 @@ _bfd_riscv_relax_section (bfd *abfd, asection *sec,
   bfd_boolean ret = FALSE;
   unsigned int i;
   bfd_vma max_alignment, reserve_size = 0;
+  riscv_pcgp_relocs pcgp_relocs;
 
   *again = FALSE;
 
@@ -2991,6 +3168,8 @@ _bfd_riscv_relax_section (bfd *abfd, asection *sec,
       || (info->disable_target_specific_optimizations
 	  && info->relax_pass == 0))
     return TRUE;
+
+  riscv_init_pcgp_relocs (&pcgp_relocs);
 
   /* Read this BFD's relocs if we haven't done so already.  */
   if (data->relocs)
@@ -3018,6 +3197,11 @@ _bfd_riscv_relax_section (bfd *abfd, asection *sec,
 		   || type == R_RISCV_LO12_I
 		   || type == R_RISCV_LO12_S)
 	    relax_func = _bfd_riscv_relax_lui;
+	  else if (!bfd_link_pic(info)
+		   && (type == R_RISCV_PCREL_HI20
+		   || type == R_RISCV_PCREL_LO12_I
+		   || type == R_RISCV_PCREL_LO12_S))
+	    relax_func = _bfd_riscv_relax_pc;
 	  else if (type == R_RISCV_TPREL_HI20
 		   || type == R_RISCV_TPREL_ADD
 		   || type == R_RISCV_TPREL_LO12_I
@@ -3106,7 +3290,8 @@ _bfd_riscv_relax_section (bfd *abfd, asection *sec,
       symval += rel->r_addend;
 
       if (!relax_func (abfd, sec, sym_sec, info, rel, symval,
-		       max_alignment, reserve_size, again))
+		       max_alignment, reserve_size, again,
+		       &pcgp_relocs))
 	goto fail;
     }
 
@@ -3115,6 +3300,7 @@ _bfd_riscv_relax_section (bfd *abfd, asection *sec,
 fail:
   if (relocs != data->relocs)
     free (relocs);
+  riscv_free_pcgp_relocs(&pcgp_relocs, abfd, sec);
 
   return ret;
 }
