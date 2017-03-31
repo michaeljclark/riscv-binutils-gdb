@@ -1,3 +1,8 @@
+2017-03-31  Palmer Dabbelt <palmer@dabbelt.com>
+
+	* riscv-dis.c (riscv_disassemble_insn): Change _gp to
+	__global_pointer$.
+
 2017-03-30  Pip Cet  <pipcet@gmail.com>
 
 	* configure.ac: Add (empty) bfd_wasm32_arch target.
