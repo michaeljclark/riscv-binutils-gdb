@@ -1,3 +1,9 @@
+2017-03-31  Palmer Dabbelt  <palmer@dabbelt.com>
+
+	* testsuite/gas/riscv/riscv.exp: Add t_gp_disas.
+	* testsuite/gas/riscv/t_gp_disas.s: New file.
+	* testsuite/gas/riscv/t_gp_disas.d: Likewise.
+
 2017-03-30  Palmer Dabbelt  <palmer@dabbelt.com>
 
 	* config/tc-riscv.c (riscv_clear_subsets): New function.
